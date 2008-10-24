@@ -1,0 +1,45 @@
+%%% File    : erlbal_http_be.erl
+%%% Author  : Todd Lipcon <todd@lipcon.org>
+%%% Description : 
+%%% Created : 23 Oct 2008 by Todd Lipcon <todd@lipcon.org>
+
+-module(erlbal_http_be).
+
+
+-export([handle_request/2]).
+
+
+handle_request(HostPort, MochiReq) when element(1, MochiReq) =:= mochiweb_request ->
+    Method = list_to_atom(string:to_lower(atom_to_list(MochiReq:get(method)))),
+    BEUrl = "http://" ++ HostPort ++ "/" ++ MochiReq::get(path),
+    io:format("BE Url: ~p~n", [BEUrl]),
+    Req = {BEUrl, []},
+    {ok, ReqId} = http:request(
+                    Method, Req,
+                    [{autoredirect, false}],
+                    [{stream, {self, once}},
+                     {sync, false}]),
+    receive
+        {http, {ReqId, stream_start, RespHeaders, StreamPid}} ->
+            MochiResp = MochiReq:start_response({200,
+                                                 RespHeaders}),
+            receive_loop(MochiReq, MochiResp, ReqId, StreamPid);
+        after 20000 ->
+                error_logger:error_msg("20sec timeout on request to backend ~p~n", [HostPort]),
+                {error, timeout}
+        end.
+
+
+receive_loop(MReq, MResp, ReqId, StreamPid) ->
+    http:stream_next(StreamPid),
+    receive
+        {http, {ReqId, stream, Binary}} ->
+            MResp:send(Binary),
+            receive_loop(MReq, MResp, ReqId, StreamPid);
+        {http, {ReqId, stream_end, _Headers}} ->
+            {ok, done};
+        {http, Other} ->
+            exit({bad_http_message, Other});
+        after 10000 ->
+                {error, timeout}
+        end.
