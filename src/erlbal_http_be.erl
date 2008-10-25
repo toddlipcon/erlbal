@@ -14,7 +14,6 @@ handle_request(HostPort, MochiReq)
        is_list(HostPort) ->
     Method = list_to_atom(string:to_lower(atom_to_list(MochiReq:get(method)))),
     BEUrl = "http://" ++ HostPort ++ MochiReq:get(path),
-    io:format("BE Url: ~p~n", [BEUrl]),
     do_be_req(Method, BEUrl, MochiReq);
 
 handle_request({url, URL}, MochiReq) when element(1, MochiReq) =:= mochiweb_request ->
@@ -23,61 +22,55 @@ handle_request({url, URL}, MochiReq) when element(1, MochiReq) =:= mochiweb_requ
 
 do_be_req(Method, BEUrl, MochiReq) ->
     ReqHdrs = mochiweb_headers:to_list(MochiReq:get(headers)),
-    ReqHdrsLists = [{any_to_list(K), any_to_list(V)} ||
-                    {K, V} <- ReqHdrs],
+    case ibrowse:send_req(
+           BEUrl, ReqHdrs, Method, [],
+           [{stream_to, self()}]) of
+        {ibrowse_req_id, ReqId} ->
+            request_started(BEUrl, MochiReq, ReqId);
+        Err = {error, _} ->
+            Err
+    end.
 
-    Req = {BEUrl, ReqHdrsLists},
-    {ok, ReqId} = http:request(
-                    Method, Req,
-                    [{autoredirect, false}],
-                    [{stream, {self, once}},
-                     {sync, false}]),
 
-    io:format("ReqId is: ~p~n", [ReqId]),
+request_started(BEUrl, MochiReq, ReqId) ->
     receive
-        {http, {ReqId, stream_start, RespHeaders, StreamPid}} ->
-            handle_stream_start(MochiReq, ReqId, StreamPid, RespHeaders);
+        {ibrowse_async_headers, ReqId, StatusCodeString, RespHeaders} ->
+            StatusCode = list_to_integer(StatusCodeString),
+            handle_stream_start(MochiReq, ReqId, {StatusCode, RespHeaders})
 
-        {http, {ReqId, {StatusLine = {"HTTP" ++ _HTTPVersion, StatusCode, Explanation},
-                        Headers,
-                        Body}}} when is_list(Headers), is_binary(Body) ->
-            error_logger:info_msg("Got immediate response!"),
-            MochiReq:respond({StatusCode, Headers, Body}),
-            {ok, done}                        
     after 20000 ->
             error_logger:error_msg("20sec timeout on request to backend ~p~n", [BEUrl]),
             {error, timeout}
     end.
 
-handle_stream_start(MReq, ReqId, StreamPid, RespHeaders) ->
-    error_logger:info_msg("Response headers: ~p~n", [RespHeaders]),
-    case proplists:get_value("x-reproxy-url", RespHeaders) of
+handle_stream_start(MReq, ReqId, {StatusCode, RespHeaders}) ->
+    case proplists:get_value("X-Reproxy-Url", RespHeaders) of
         undefined ->
-            MResp = MReq:start_response({200,
+            MResp = MReq:start_response({StatusCode,
                                          RespHeaders}),
-            receive_loop(MReq, MResp, ReqId, StreamPid);
+            receive_loop(MReq, MResp, ReqId);
         Reproxy ->
-            error_logger:info_msg("Reproxy: ~p~n", [Reproxy]),
-
             % We no longer need the original Backend request
-            http:cancel_request(ReqId),
-            
-            % However we might have something in our queue for this backend
-            % so flush any messages
+            % sadly there's no way to cancel a request in ibrowse
+
+            % Flush any leftover messages
             flush_http_req(ReqId),
             {ok, {reproxy, Reproxy}}
     end.
 
-receive_loop(MReq, MResp, ReqId, StreamPid) ->
-    http:stream_next(StreamPid),
+receive_loop(MReq, MResp, ReqId) ->
     receive
-        {http, {ReqId, stream, Binary}} ->
-            MResp:send(Binary),
-            receive_loop(MReq, MResp, ReqId, StreamPid);
-        {http, {ReqId, stream_end, _Headers}} ->
+        {ibrowse_async_response, ReqId, Body} ->
+            MResp:send(Body),
+            receive_loop(MReq, MResp, ReqId);
+
+        {ibrowse_async_response_end, ReqId} ->
             {ok, done};
-        {http, Other} ->
-            exit({bad_http_message, Other})
+
+        Else ->
+            error_logger:error_msg("ignoring other message: ~p~n", [Else]),
+            receive_loop(MReq, MResp, ReqId)
+            
     after 10000 ->
             {error, timeout}
     end.
@@ -85,16 +78,10 @@ receive_loop(MReq, MResp, ReqId, StreamPid) ->
 
 flush_http_req(ReqId) ->
     receive
-        {http, {ReqId, _, _, _}} ->
+        {ibrowse_async_response, ReqId, _} ->
             flush_http_req(ReqId);
-        {http, {ReqId, _, _}} ->
-            flush_http_req(ReqId);
-        {http, {ReqId, _}} ->
+        {ibrowse_async_response_end, ReqId} ->
             flush_http_req(ReqId)
     after 0 ->
             ok
     end.
-         
-any_to_list(X) when is_list(X) -> X;
-any_to_list(X) when is_atom(X) -> atom_to_list(X);
-any_to_list(X) when is_binary(X) -> binary_to_list(X).

@@ -12,22 +12,20 @@
 
 start(Options) ->
     {DocRoot, Options1} = get_option(docroot, Options),
+    {ok, DefaultBackend} = application:get_env(default_backend),
     Loop = fun (Req) ->
-		   ?MODULE:loop(Req, DocRoot)
+		   ?MODULE:loop(Req, DefaultBackend)
 	   end,
     mochiweb_http:start([{name, ?MODULE}, {loop, Loop} | Options1]).
 
 stop() ->
     mochiweb_http:stop(?MODULE).
 
-loop(Req, DocRoot) ->
+loop(Req, DefaultBE) ->
     "/" ++ Path = Req:get(path),
     case Req:get(method) of
 	Method when Method =:= 'GET'; Method =:= 'HEAD' ->
-	    case Path of
-		_ ->
-		    Req:serve_file(Path, DocRoot)
-	    end;
+            handle_req_loop(DefaultBE, Req);
 	'POST' ->
 	    case Path of
 		_ ->
@@ -41,3 +39,41 @@ loop(Req, DocRoot) ->
 
 get_option(Option, Options) ->
     {proplists:get_value(Option, Options), proplists:delete(Option, Options)}.
+
+
+handle_req_loop(BE, Req) ->
+    case dispatch_to_backend(BE, Req) of
+        {ok, {redirect, NewBE, NewReq}} ->
+            io:format("Dispatching to new backend: ~p", [NewBE]),
+            handle_req_loop(NewBE, NewReq);
+
+        {ok, {reproxy, RPHeader}} ->
+            try_reproxy(string:tokens(RPHeader, " "),
+                        Req);
+
+        {ok, done} ->
+            ok;
+        
+        Err = {error, _} -> Err
+    end.
+
+dispatch_to_backend({balancer, Name}, Req) when is_atom(Name) ->
+    erlbal_balancer:handle_request(Name, Req);
+
+dispatch_to_backend({http, HostPort}, Req) ->
+    erlbal_http_be:handle_request(HostPort, Req).
+
+try_reproxy([URL | Rest], Req) ->
+    BE = {http, {url, URL}},
+    case handle_req_loop(BE, Req) of
+        Err = {error, _} ->
+            error_logger:info_msg("Failed reproxy: ~p. Trying rest: ~p~n",
+                                  [Err, Rest]),
+            try_reproxy(Rest, Req);
+
+        Else ->
+            Else
+    end;
+
+try_reproxy([], _Req) ->
+    {error, no_reproxies_left}.

@@ -44,7 +44,6 @@ get_option(Option, Options) ->
 handle_req_loop(BE, Req) ->
     case dispatch_to_backend(BE, Req) of
         {ok, {redirect, NewBE, NewReq}} ->
-            io:format("Dispatching to new backend: ~p", [NewBE]),
             handle_req_loop(NewBE, NewReq);
 
         {ok, {reproxy, RPHeader}} ->
